@@ -237,11 +237,11 @@ class RoChat:
     # ── Outgoing message (NO LOCAL DUPLICATION) ───────────────────
 
     def _on_send(self, channel: str, text: str):
-        if not self._place_id:
+        if channel == "server" and not self._place_id:
             if self.overlay:
                 self.overlay.add_message(
                     channel, "Система",
-                    "Вы сейчас не в игре. Войдите в плейс Roblox, чтобы писать сообщения.",
+                    "Вы сейчас не в игре. Переключитесь на вкладку «Глобальный» или войдите в плейс Roblox.",
                     _now(), is_system=True,
                 )
             return

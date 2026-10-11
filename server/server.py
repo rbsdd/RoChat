@@ -93,6 +93,13 @@ class ChatServer:
         client["place_id"] = None
         client["job_id"] = None
 
+    async def _broadcast_global(self, message, exclude=None):
+        targets = [ws for ws, c in self.clients.items() if c.get("authenticated")]
+        payload = json.dumps(message, ensure_ascii=False)
+        coros = [ws.send(payload) for ws in targets if ws != exclude]
+        if coros:
+            await asyncio.gather(*coros, return_exceptions=True)
+
     async def _broadcast_to_place(self, place_id, message, exclude=None):
         targets = self.place_rooms.get(place_id, set())
         payload = json.dumps(message, ensure_ascii=False)
@@ -132,6 +139,18 @@ class ChatServer:
         }))
         logger.info("Authenticated: %s (ID %s)", username, user_id)
 
+        # Check if another device of the same user is already in a game
+        for other_ws, other_client in list(self.clients.items()):
+            if other_ws != ws and other_client.get("user_id") == client["user_id"] and other_client.get("place_id") and other_client.get("place_id") != "lobby":
+                auto_place = other_client["place_id"]
+                auto_job = other_client["job_id"]
+                logger.info("Auto-syncing active game (%s, %s) for user %s on new device", auto_place, auto_job, username)
+                await self.handle_join(ws, {"place_id": auto_place, "job_id": auto_job})
+                return
+
+        # Default join to lobby room so chat works immediately
+        await self.handle_join(ws, {"place_id": "lobby", "job_id": "default"})
+
     async def handle_join(self, ws, data):
         client = self.clients[ws]
         if not client["authenticated"]:
@@ -139,10 +158,8 @@ class ChatServer:
 
         await self._leave_rooms(ws)
 
-        place_id = str(data.get("place_id", "")).strip()
+        place_id = str(data.get("place_id", "")).strip() or "lobby"
         job_id = str(data.get("job_id", "")).strip() or "default"
-        if not place_id:
-            return
 
         client["place_id"] = place_id
         client["job_id"] = job_id
@@ -177,9 +194,17 @@ class ChatServer:
 
         logger.info("%s joined place=%s server=%s", client["username"], place_id, job_id)
 
+        # Sync any other connected devices of the same user
+        if place_id != "lobby":
+            for other_ws, other_client in list(self.clients.items()):
+                if other_ws != ws and other_client.get("user_id") == client["user_id"]:
+                    if other_client.get("place_id") != place_id or other_client.get("job_id") != job_id:
+                        logger.info("Syncing second device of %s to game %s", client["username"], place_id)
+                        asyncio.create_task(self.handle_join(other_ws, {"place_id": place_id, "job_id": job_id}))
+
     async def handle_message(self, ws, data):
         client = self.clients[ws]
-        if not client["authenticated"] or not client["place_id"]:
+        if not client["authenticated"]:
             return
 
         channel = data.get("channel", "server")
@@ -197,12 +222,33 @@ class ChatServer:
         }
 
         if channel == "global":
-            await self._broadcast_to_place(client["place_id"], message)
+            await self._broadcast_global(message)
         else:  # server
-            key = (client["place_id"], client["job_id"])
+            place_id = client.get("place_id") or "lobby"
+            job_id = client.get("job_id") or "default"
+            key = (place_id, job_id)
             await self._broadcast_to_server(key, message)
 
     # ── main handler ─────────────────────────────────────────────────
+
+    async def handle_leave(self, ws):
+        client = self.clients.get(ws)
+        if not client or not client.get("authenticated"):
+            return
+
+        old_place = client.get("place_id")
+        await self._leave_rooms(ws)
+        # Put this client into lobby
+        await self.handle_join(ws, {"place_id": "lobby", "job_id": "default"})
+
+        # Sync leave/lobby to all other devices of this user if user actually left a game
+        if old_place and old_place != "lobby":
+            for other_ws, other_client in list(self.clients.items()):
+                if other_ws != ws and other_client.get("user_id") == client["user_id"]:
+                    if other_client.get("place_id") != "lobby":
+                        logger.info("Syncing leave/lobby to second device of %s", client["username"])
+                        await self._leave_rooms(other_ws)
+                        await self.handle_join(other_ws, {"place_id": "lobby", "job_id": "default"})
 
     async def handle_client(self, ws, path=None):
         await self.register(ws)
@@ -220,7 +266,7 @@ class ChatServer:
                 elif msg_type == "join":
                     await self.handle_join(ws, data)
                 elif msg_type == "leave":
-                    await self._leave_rooms(ws)
+                    await self.handle_leave(ws)
                 elif msg_type == "message":
                     await self.handle_message(ws, data)
                 elif msg_type == "ping":
